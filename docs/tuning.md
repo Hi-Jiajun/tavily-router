@@ -6,7 +6,7 @@
 
 | 项 | 调优前 | 调优后 | 依据 |
 | --- | --- | --- | --- |
-| 响应缓存 | 关 | 开，TTL 1 小时（仅 `POST /search`） | 同一 query 第 2 波 6/6 本地命中，耗时 4.40s→1.04s，不再消耗上游额度 |
+| 响应缓存 | 关 | 开，TTL 5 分钟（仅 `POST /search`） | 同一 query 第 2 波 6/6 本地命中，耗时 4.40s→1.04s，不再消耗上游额度 |
 | 额度自动同步 | 关（选路基于旧数据） | 每 15 分钟，`request_interval_seconds=1` | 选路依据准确；远低于 `/usage` 的 10 次/10 分钟限制 |
 | 请求日志保留 | 30 天 | 7 天 | 日志含 query 与响应正文，缩短落盘面 |
 | 入口整形 | 无 | 12 req/s + burst 120 排队（`limit_req`） | 100 并发实测：停用 0.06s 全放行（上游被打爆）；启用后 8.29s 内 0 个本地 429 全放行 |
@@ -43,4 +43,22 @@
 | --- | --- |
 | 更低延迟 | 调小 `burst`，或给 `limit_req` 加 `nodelay`（突发直接放行，代价是更容易撞上游限速） |
 | 更高吞吐 | 增加上游 key 数，并同步提高 `rate`（按每把 key ≈3 req/s 估算） |
-| 更省额度 | 加大缓存 TTL；对实时性要求高的请求加 `no_cache=true` 查询参数绕过缓存 |
+| 更省额度 | 加大缓存 TTL（注意下面的绕过限制） |
+| 要最新结果 | REST 请求加查询参数 `no_cache=true` 绕过缓存；MCP 路径没有这个开关，只能靠调小 TTL 或临时关缓存 |
+
+## 缓存的绕过限制（实测）
+
+`no_cache=true` 是 **REST 的查询参数**：网关在缓存查找前解析 `req.RawQuery` 取出并剥离它。
+而 MCP 的 `tavily-search` 工具参数表里**没有任何缓存开关**（实测参数为 `query` / `search_depth` /
+`topic` / `max_results` / `include_*` / `exclude_domains` / `time_range` / `start_date` /
+`end_date` / `country` / `auto_parameters` / `chunks_per_source` / `include_usage`）。
+
+也就是说：**经 MCP 调用无法强制取最新结果**，同一 query 在 TTL 内一定命中缓存。
+因此 TTL 设为 5 分钟（而不是文档默认的 12 小时或常见的 1 小时）——既保留"同一批任务里重复查询"
+的收益，又不会让时效性查询吃到太旧的数据。需要最新时走 REST：
+
+```bash
+curl -sS -X POST 'http://<LAN_ADDR>:8080/search?no_cache=true' \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"query":"...","max_results":5}'
+```
