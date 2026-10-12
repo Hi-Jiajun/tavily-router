@@ -1,0 +1,21 @@
+[Unit]
+Description=tavily-router - multi-key pool proxy with MCP endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 只监听 loopback：局域网侧一律经 nginx 进入（/api/* 在 nginx 上被拒）
+WorkingDirectory=%h/tavily-router
+Environment=LISTEN_ADDR=127.0.0.1:8080
+Environment=DATABASE_PATH=%h/tavily-router/data/proxy.db
+Environment=TAVILY_BASE_URL=https://api.tavily.com
+Environment=UPSTREAM_TIMEOUT=150s
+# 无状态模式可避免客户端出现 "session not found"；有状态需保证会话粘性
+Environment=MCP_STATELESS=true
+ExecStart=%h/tavily-router/dist/tavily-proxy-linux-amd64
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

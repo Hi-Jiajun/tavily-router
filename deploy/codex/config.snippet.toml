@@ -1,0 +1,23 @@
+# Codex 客户端接入片段（追加到 ~/.codex/config.toml）
+#
+# 关键点：真实 key 与 Master Key 都不写进本文件。
+#   1) tavily        走自建网关，Bearer 由本地命令提供（http_headers_helper）
+#   2) tavily-keyless 官方免 key 通道，作为额度耗尽时的兜底
+# 注意：Codex 会把 helper 的取值缓存，并在同源 401/403 后自动刷新。
+
+[mcp_servers.tavily]
+url = "http://<LAN_ADDR>:8080/mcp"
+enabled = true
+startup_timeout_sec = 30
+tool_timeout_sec = 120
+# 本地命令，输出 {"Authorization":"Bearer <token>"} 形式的 JSON
+http_headers_helper = "~/.codex/bin/tavily-router-headers.sh"
+
+[mcp_servers.tavily-keyless]
+url = "https://mcp.tavily.com/mcp/"
+enabled = true
+startup_timeout_sec = 30
+tool_timeout_sec = 180
+
+[mcp_servers.tavily-keyless.http_headers]
+X-Tavily-Access-Mode = "keyless"
