@@ -47,7 +47,7 @@ security add-generic-password -a "$USER" -s tavily-router-master-key -w '<master
 MK=$(security find-generic-password -a "$USER" -s tavily-router-master-key -w)
 curl -X POST http://127.0.0.1:8080/api/keys -H "Authorization: Bearer $MK" \
   -H 'Content-Type: application/json' \
-  -d '{"key":"tvly-...","alias":"account-a","total_quota":1000}'
+  -d '{"key":"<TAVILY_API_KEY>","alias":"account-a","total_quota":1000}'
 curl -X POST http://127.0.0.1:8080/api/keys/sync -H "Authorization: Bearer $MK"
 
 # 6) 入口拆分（先改 <LAN_ADDR> 与端口）
