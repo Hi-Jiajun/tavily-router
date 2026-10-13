@@ -8,18 +8,23 @@
 
 退出码：0=正常（含"已发信"）；3=需要动作但邮件未配置（让上层告警可见）；1=采集失败。
 
+发信触发（--email-on，默认 pool,429）：
+  pool = 额度不足撑到重置（建议加号）；429 = 出现 429（要么加号、要么调限速）；
+  还可选 cost / key / sync / all。其余动作只写报告不发信。
+
 邮件通道（按序尝试，--no-email 可跳过）：
   ① SMTP：凭据放 Keychain，条目 service=smtp-notify，account=<发件地址>，值=应用专用密码；
      可选附加属性：security add-generic-password -a <发件地址> -s smtp-notify -w '<app-password>' \
        -l smtp-host=<host> -l smtp-port=<port> -A -U
-  ② Mail.app：若已配置账号，用 AppleScript 自寄（本机实测当前未配置账号）。
+  ② Mail.app：用 AppleScript 经指定账号发出（默认发件人 TVR_MAIL_SENDER，本机为 3138947285@qq.com；
+     收件人默认同发件人，可用 TVR_NOTIFY_TO 覆盖）。2026-10-13 实测已成功发出。
 
-用法（`TVR_SSH` 必填，其余按需）：
-  TVR_SSH=user@host scripts/daily-report.py                       # 采集 → 写报告 → 需要时发信
-  TVR_SSH=user@host scripts/daily-report.py --dry-run --no-email   # 只打印结论，不落盘不发信
-  TVR_SSH=user@host scripts/daily-report.py --date 2026-10-13      # 指定报告日期（默认今天）
+用法（TVR_SSH 必填，其余按需）：
+  TVR_SSH=user@host scripts/daily-report.py                        # 采集 → 写报告 → 需要时发信
+  TVR_SSH=user@host scripts/daily-report.py --dry-run --no-email    # 只打印结论，不落盘不发信
+  TVR_SSH=user@host scripts/daily-report.py --test-email            # 只测邮件通道
 
-环境变量：TVR_SSH（管理面所在主机，必填）/ TVR_KEYCHAIN_SERVICE / TVR_NOTIFY_TO /
+环境变量：TVR_SSH / TVR_KEYCHAIN_SERVICE / TVR_NOTIFY_TO / TVR_MAIL_SENDER / TVR_EMAIL_ON /
 TVR_SMTP_SERVICE / TVR_SMTP_HOST / TVR_SMTP_PORT，以及四个阈值 TVR_RESERVE_RATIO /
 TVR_PEAK_CONC_WARN / TVR_COST_PER_REQ_WARN / TVR_CACHE_IDLE_REQUESTS。
 """
@@ -37,9 +42,11 @@ REPORTS = os.path.join(ROOT, "reports")
 HISTORY = os.path.join(REPORTS, "history.csv")
 
 VM = os.environ.get("TVR_SSH", "")
+ENTRY = os.environ.get("TVR_ENTRY", "http://192.168.1.60:8080")
 KEYCHAIN_SERVICE = os.environ.get("TVR_KEYCHAIN_SERVICE", "tavily-router-master-key")
 NOTIFY_TO = os.environ.get("TVR_NOTIFY_TO", "")
 SMTP_SERVICE = os.environ.get("TVR_SMTP_SERVICE", "smtp-notify")
+MAIL_SENDER = os.environ.get("TVR_MAIL_SENDER", "3138947285@qq.com")
 
 # 阈值（可在环境变量里覆盖）
 TH = {
@@ -162,15 +169,18 @@ def analyze(data, prev_used):
     days_to_empty = round(remaining / burn, 1) if burn else None
 
     findings, actions = [], []
+
+    def act(tag, text):
+        actions.append({"tag": tag, "text": text})
     if burn is None:
         findings.append("首次运行：还没有上一日快照，今天算不出日消耗（明天起有）")
     if days_to_empty is not None:
         if days_to_empty < days_left * (1 + TH["reserve_ratio"]):
-            actions.append("额度紧张：按当前 %.0f credits/天，预计 %.1f 天后耗尽，而距重置还有 %d 天 → **建议加号**" % (burn, days_to_empty, days_left))
+            act("pool", "额度紧张：按当前 %.0f credits/天，预计 %.1f 天后耗尽，而距重置还有 %d 天 → **建议加号**" % (burn, days_to_empty, days_left))
         else:
             findings.append("额度充裕：按当前 %s credits/天，可支撑 %.1f 天（重置还有 %d 天）" % (burn, days_to_empty, days_left))
     if status.get(429):
-        actions.append("昨日出现 429 共 %d 次 → 说明突发超过上游容忍度，考虑加号或调小限速/加大 burst" % status[429])
+        act("429", "昨日出现 429 共 %d 次 → 突发超过上游容忍度：要么加号（更多 key 摊并发），要么调小限速/加大 burst" % status[429])
     peak = data.get("peak_concurrency_24h") or 0
     # 峰值并发只作记录：真实上限约 12 rps 稳态，但瞬时峰值高不等于有问题
     # （压测/合成流量会把它推高），真正可靠的信号是 429 计数。
@@ -179,14 +189,14 @@ def analyze(data, prev_used):
     if peak > TH["peak_conc_warn"] and not status.get(429):
         findings.append("峰值并发偏高但未出现 429 → 入口队列吸收了突发，暂无需调整")
     if per_req is not None and per_req > TH["cost_per_req_warn"]:
-        actions.append("每次请求均耗 %.2f credits（>%.1f）→ 检查是否有人用了 search_depth=advanced / include_raw_content" % (per_req, TH["cost_per_req_warn"]))
+        act("cost", "每次请求均耗 %.2f credits（>%.1f）→ 检查是否有人用了 search_depth=advanced / include_raw_content" % (per_req, TH["cost_per_req_warn"]))
     if reqs >= TH["cache_idle_requests"] and not cache.get("total_hits"):
         findings.append("缓存 24h 零命中（请求 %d 次）→ 查询基本不重复，TTL 可维持 5 分钟或直接关掉省内存" % reqs)
     bad = [k.get("alias") for k in keys if k.get("is_invalid") or not k.get("is_active")]
     if bad:
-        actions.append("存在失效/停用 key：%s → 清理或替换" % ", ".join(str(b) for b in bad))
+        act("key", "存在失效/停用 key：%s → 清理或替换" % ", ".join(str(b) for b in bad))
     if not sync.get("enabled"):
-        findings.append("额度自动同步处于关闭状态 → 选路依据会变旧")
+        act("sync", "额度自动同步被关闭 → 选路依据会变旧，建议重新开启")
     return {
         "days_left": days_left, "total": total, "used": used, "remaining": remaining,
         "burn": burn, "per_req": per_req, "days_to_empty": days_to_empty,
@@ -234,21 +244,30 @@ def write_report(day, data, res, prev_date):
         lines.append("")
         lines.append("**需要动作：**")
         for a in res["actions"]:
-            lines.append("- %s" % a)
+            lines.append("- `%s` %s" % (a["tag"], a["text"]))
     else:
         lines.append("- 无需调整")
     path = os.path.join(REPORTS, "%s.md" % day)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
 
-    new = not os.path.exists(HISTORY)
-    with open(HISTORY, "a", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        if new:
-            w.writerow(["date", "total_quota", "total_used", "requests_24h", "peak_concurrency", "status_429", "cache_hits"])
-        w.writerow([day, res["total"], res["used"], data.get("requests_24h"),
-                    data.get("peak_concurrency_24h"), (data.get("status_24h") or {}).get(429, 0),
-                    (data.get("cache") or {}).get("total_hits", 0)])
+    # 同一天重复运行只保留一行（幂等覆盖），避免历史里出现重复日期
+    header = ["date", "total_quota", "total_used", "requests_24h", "peak_concurrency", "status_429", "cache_hits"]
+    old = []
+    if os.path.exists(HISTORY):
+        with open(HISTORY, newline="", encoding="utf-8") as fh:
+            old = [r for r in csv.DictReader(fh) if r.get("date") and r.get("date") != day]
+    row = {"date": day, "total_quota": res["total"], "total_used": res["used"],
+           "requests_24h": data.get("requests_24h"),
+           "peak_concurrency": data.get("peak_concurrency_24h"),
+           "status_429": (data.get("status_24h") or {}).get(429, 0),
+           "cache_hits": (data.get("cache") or {}).get("total_hits", 0)}
+    with open(HISTORY, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=header)
+        w.writeheader()
+        for r in old:
+            w.writerow({k: r.get(k, "") for k in header})
+        w.writerow(row)
     return path
 
 
@@ -287,27 +306,47 @@ def smtp_send(subject, body):
         return False
 
 
-def mailapp_send(subject, body):
-    """Mail.app 通道（需已配置账号）。返回 True 表示已交给 Mail.app。"""
+def mailapp_send(subject, body, sender=None, to=None):
+    """Mail.app 通道：指定账号发出（默认 TVR_MAIL_SENDER 自发自收）。
+
+    正文经临时文件交给 AppleScript 读取，避免引号/换行/中文的转义问题。
+    返回 True 表示 AppleScript 无错误（= 已交给 Mail.app 外发）。
+    """
     probe = subprocess.run(["/usr/bin/osascript", "-e", 'tell application "Mail" to count accounts'],
                            capture_output=True, text=True, timeout=20)
     if probe.stdout.strip() in ("", "0"):
         return False
-    to = NOTIFY_TO
-    if not to:
-        addr = subprocess.run(["/usr/bin/osascript", "-e",
-                               'tell application "Mail" to get address of account 1'],
-                              capture_output=True, text=True, timeout=20).stdout.strip()
-        to = addr
-    if not to:
-        return False
-    script = ('tell application "Mail" to make new outgoing message with properties '
-              '{subject:"%s", content:"%s", visible:false} at end of outgoing messages' % (
-                  subject.replace('"', "'"), body.replace('"', "'").replace("\n", "\\n")))
-    subprocess.run(["/usr/bin/osascript", "-e", script, "-e",
-                    'tell application "Mail" to send every outgoing message whose subject is "%s"' % subject.replace('"', "'")],
-                   capture_output=True, text=True, timeout=30)
-    return True
+    sender = sender or MAIL_SENDER
+    to = to or NOTIFY_TO or sender
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as fh:
+        fh.write(body)
+        body_path = fh.name
+    os.chmod(body_path, 0o600)
+    def esc(s):  # 只用于单行字段
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+    script = '''
+set msgBody to (read POSIX file "%s" as «class utf8»)
+tell application "Mail"
+    set msg to make new outgoing message with properties {subject:"%s", content:msgBody, visible:false}
+    tell msg
+        set sender to "%s"
+        make new to recipient at end of to recipients with properties {address:"%s"}
+    end tell
+    send msg
+end tell
+''' % (body_path, esc(subject), esc(sender), esc(to))
+    try:
+        p = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True, timeout=90)
+        if p.returncode != 0:
+            print("WARN: Mail.app 发送失败: %s" % ((p.stderr or p.stdout).strip()[:200]), file=sys.stderr)
+            return False
+        return True
+    finally:
+        try:
+            os.unlink(body_path)
+        except OSError:
+            pass
 
 
 def main():
@@ -316,10 +355,27 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="只打印结论，不落盘不发信")
     ap.add_argument("--no-email", action="store_true")
     ap.add_argument("--to", default="", help="覆盖收件地址（默认 TVR_NOTIFY_TO 或发件地址自身）")
+    ap.add_argument("--test-email", action="store_true", help="只发一封通道自测邮件，不采集")
+    ap.add_argument("--email-on", default=os.environ.get("TVR_EMAIL_ON", "pool,429"),
+                    help="哪些动作类触发发信，逗号分隔：pool(建议加号) / 429 / cost / key / sync / all（默认 pool,429）")
     args = ap.parse_args()
     global NOTIFY_TO
     if args.to:
         NOTIFY_TO = args.to
+
+    if args.test_email:
+        subject = "[tavily-router] 邮件通道自测"
+        body = ("这是一封自测邮件：由 ~/Documents/tavily-router/scripts/daily-report.py 发出。\n"
+                "发件地址：%s\n收件地址：%s\n时间：%s\n" % (MAIL_SENDER, NOTIFY_TO or MAIL_SENDER,
+                                                    datetime.datetime.now().isoformat(timespec="seconds")))
+        if smtp_send(subject, body):
+            print("邮件已发送（SMTP）")
+        elif mailapp_send(subject, body):
+            print("邮件已发送（Mail.app，发件 %s）" % MAIL_SENDER)
+        else:
+            print("EMAIL_NOT_CONFIGURED: SMTP 与 Mail.app 都不可用", file=sys.stderr)
+            return 3
+        return 0
 
     data = collect()
     # JSON 往返会把 int 键变成字符串（如 {"429": 160}），这里统一还原，否则阈值判断永远不触发
@@ -334,7 +390,7 @@ def main():
         res["remaining"], res["total"], data.get("requests_24h"), data.get("peak_concurrency_24h"),
         (data.get("status_24h") or {}).get(429, 0), res["burn"], res["days_to_empty"], res["days_left"]))
     for a in res["actions"]:
-        print("ACTION: " + a)
+        print("ACTION[%s]: %s" % (a["tag"], a["text"]))
 
     if args.dry_run:
         return 0
@@ -342,21 +398,27 @@ def main():
     path = write_report(args.date, data, res, prev_date)
     print("报告: %s" % path)
 
-    if not res["actions"] or args.no_email:
+    triggers = {t.strip() for t in args.email_on.split(",") if t.strip()}
+    due = [a for a in res["actions"] if "all" in triggers or a["tag"] in triggers]
+    if not due or args.no_email:
+        if res["actions"] and not due:
+            print("提示：有动作项但按 --email-on=%s 不触发发信（报告已记录）" % args.email_on)
         return 0
-    subject = "[tavily-router] %s 需要动作：%s" % (args.date, res["actions"][0][:40])
+    subject = "[tavily-router] %s %s" % (args.date, due[0]["text"][:50])
     body = "日期：%s\n\n池：%s/%s 剩余；24h 请求 %s；峰值并发 %s；429 %s；日消耗 %s；预计 %s 天后耗尽（距重置 %s 天）\n\n需要动作：\n%s\n\n报告：%s\n" % (
         args.date, res["remaining"], res["total"], data.get("requests_24h"),
         data.get("peak_concurrency_24h"), (data.get("status_24h") or {}).get(429, 0),
         res["burn"], res["days_to_empty"], res["days_left"],
-        "\n".join("- " + a for a in res["actions"]), path)
+        "\n".join("- [%s] %s" % (a["tag"], a["text"]) for a in res["actions"]), path)
     sent = smtp_send(subject, body)
+    channel = "SMTP"
     if not sent:
         sent = mailapp_send(subject, body)
+        channel = "Mail.app(%s)" % MAIL_SENDER
     if sent:
-        print("邮件已发送")
+        print("邮件已发送（%s）" % channel)
         return 0
-    print("EMAIL_NOT_CONFIGURED: 有动作项但邮件通道不可用（SMTP Keychain 条目 %s / Mail.app 账号均无）" % SMTP_SERVICE,
+    print("EMAIL_NOT_CONFIGURED: 有动作项但邮件通道不可用（SMTP Keychain %s / Mail.app 账号均不可用）" % SMTP_SERVICE,
           file=sys.stderr)
     return 3
 
