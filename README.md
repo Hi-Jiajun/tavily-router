@@ -113,6 +113,9 @@ TVR_ENTRY=http://<router-host>:8080 TVR_SSH=user@<router-host> scripts/health-ch
 
 # 入口压测（会消耗上游额度；先用 --dry 看计划）
 scripts/loadtest.py --entry http://<router-host>:8080 --waves 2 --concurrency 20
+
+# 每日分析（池用量 / 并发 / 429 / 缓存 → reports/；需要动作时可按阈值发邮件）
+TVR_SSH=user@<router-host> scripts/daily-report.py     # 先看结论可加 --dry-run --no-email
 ```
 
 Web 控制台不再从局域网直连，用 SSH 隧道访问：
@@ -145,7 +148,7 @@ ssh -L 8080:127.0.0.1:8080 user@<router-host>
 
 ```
 deploy/   入口 nginx 配置、systemd 单元、Codex 客户端接入片段
-scripts/  健康检查与压测
+scripts/  健康检查、入口压测、每日分析（写 reports/）
 docs/     部署与加固、调优记录、限速实测
 ```
 
