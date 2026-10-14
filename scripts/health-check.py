@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """tavily-router 健康检查 —— 适合作为定时告警的触发点。
 
 检查项：入口可达性、服务存活、池内剩余额度、key 有效性、额度同步新鲜度。

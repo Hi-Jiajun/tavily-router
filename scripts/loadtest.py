@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """tavily-router 入口压测 —— 统计 429 比例与延迟分布。
 
 会真实消耗上游额度：每次成功的 /search 计 1 credit，被 429 的请求不计费。

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """tavily-router 每日分析：消耗量 / 并发形态 / 429 / 缓存，并判断号池与配置要不要调。
 
 产出：
